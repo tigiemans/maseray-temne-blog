@@ -68,7 +68,7 @@ export default async function handler(request) {
   }
 
   const eventType = getString(event, ["type", "event", "eventType", "name"]);
-  if (eventType !== "payment.completed") {
+  if (eventType !== "checkout_session.completed") {
     return json({ received: true, ignored: true }, 200);
   }
 
