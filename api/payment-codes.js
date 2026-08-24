@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "./_lib/db.js";
 import { json, methodNotAllowed, logError } from "./_lib/http.js";
-import { validateContributionInput, formatMajorAmount } from "./_lib/contributions.js";
+import { validateContributionInput, formatMajorAmount, SUPPORTED_PROVIDERS } from "./_lib/contributions.js";
 
 const MONIME_URL = "https://api.monime.io/v1/payment-codes";
+
+function buildInstructions(ussdCode, provider, amountMinor) {
+  if (!ussdCode) {
+    return "Follow the payment instructions provided by Monime to complete your contribution.";
+  }
+  const providerLabel = SUPPORTED_PROVIDERS[provider] || "Mobile Money";
+  return `Dial ${ussdCode} from your ${providerLabel} line and follow the prompts to complete your SLE ${formatMajorAmount(amountMinor)} contribution.`;
+}
 
 export default async function handler(request) {
   if (request.method !== "POST") return methodNotAllowed();
@@ -46,35 +54,34 @@ export default async function handler(request) {
                ussd_payment_code, monime_status, expires_at, status
         FROM contributions
         WHERE client_request_id = ${clientRequestId}
-        LIMIT 1
+        LIMIT 1;
       `;
       if (existing.length) {
+        const item = existing[0];
         return json({
           success: true,
           replayed: true,
           contribution: {
-            type: existing[0].contribution_type,
+            type: item.contribution_type,
             name: input.name,
-            customerName: existing[0].customer_name,
-            amount: Number(existing[0].amount_minor) / 100,
-            amountMinor: Number(existing[0].amount_minor),
+            customerName: item.customer_name,
+            amount: Number(item.amount_minor) / 100,
+            amountMinor: Number(item.amount_minor),
             currency: "SLE",
-            provider: existing[0].payment_provider,
-            reference: existing[0].reference,
-            status: existing[0].status,
+            provider: item.payment_provider,
+            reference: item.reference,
+            status: item.status,
           },
           payment: {
-            id: existing[0].monime_payment_code_id,
-            ussdCode: existing[0].ussd_payment_code,
-            status: existing[0].monime_status,
-            amount: { currency: "SLE", value: Number(existing[0].amount_minor) },
+            id: item.monime_payment_code_id,
+            ussdCode: item.ussd_payment_code,
+            status: item.monime_status,
+            amount: { currency: "SLE", value: Number(item.amount_minor) },
             currency: "SLE",
-            reference: existing[0].reference,
-            expiresAt: existing[0].expires_at,
+            reference: item.reference,
+            expiresAt: item.expires_at,
           },
-          instructions: existing[0].ussd_payment_code
-            ? `Dial ${existing[0].ussd_payment_code} from your Orange Money line and follow the prompts to complete your SLE ${formatMajorAmount(existing[0].amount_minor)} contribution.`
-            : "Follow the payment instructions provided by Monime to complete your contribution.",
+          instructions: buildInstructions(item.ussd_payment_code, item.payment_provider, item.amount_minor),
         }, 200);
       }
     }
@@ -90,7 +97,7 @@ export default async function handler(request) {
         ${randomUUID()}, ${input.contributionType}, ${input.customerName},
         ${input.amountMinor.toString()}, 'SLE', ${input.paymentProvider},
         ${reference}, ${idempotencyKey}, ${clientRequestId}, 'PENDING'
-      )
+      );
     `;
 
     const payload = {
@@ -106,7 +113,7 @@ export default async function handler(request) {
         name: input.customerName,
       },
       reference,
-      authorizedProviders: ["m17"],
+      authorizedProviders: [input.paymentProvider],
       metadata: {
         project: "Maseray Temne Blogger",
         contribution_type: input.contributionType,
@@ -132,7 +139,7 @@ export default async function handler(request) {
       await db`
         UPDATE contributions
         SET status = 'FAILED', monime_response = ${JSON.stringify(data ?? {})}::jsonb
-        WHERE reference = ${reference}
+        WHERE reference = ${reference};
       `;
       console.error("Monime Payment Code creation failed", {
         status: response.status,
@@ -151,7 +158,7 @@ export default async function handler(request) {
         monime_status = ${result.status ?? "pending"},
         expires_at = ${result.expireTime ? new Date(result.expireTime) : null},
         monime_response = ${JSON.stringify(data)}::jsonb
-      WHERE reference = ${reference}
+      WHERE reference = ${reference};
     `;
 
     return json({
@@ -163,7 +170,7 @@ export default async function handler(request) {
         amount: Number(input.amountMinor) / 100,
         amountMinor: Number(input.amountMinor),
         currency: "SLE",
-        provider: "m17",
+        provider: input.paymentProvider,
         reference,
         status: "PENDING",
       },
@@ -176,9 +183,7 @@ export default async function handler(request) {
         reference: result.reference,
         expiresAt: result.expireTime,
       },
-      instructions: result.ussdCode
-        ? `Dial ${result.ussdCode} from your Orange Money line and follow the prompts to complete your SLE ${formatMajorAmount(input.amountMinor)} contribution.`
-        : "Follow the payment instructions provided by Monime to complete your contribution.",
+      instructions: buildInstructions(result.ussdCode, input.paymentProvider, input.amountMinor),
     }, 201);
   } catch (error) {
     logError("Payment Code endpoint failed", error, { contributionType: input.contributionType });
