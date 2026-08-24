@@ -9,8 +9,8 @@ function buildInstructions(ussdCode, provider, amountMinor) {
   if (!ussdCode) {
     return "Follow the payment instructions provided by Monime to complete your contribution.";
   }
-  const providerLabel = SUPPORTED_PROVIDERS[provider] || "Mobile Money";
-  return `Dial ${ussdCode} from your ${providerLabel} line and follow the prompts to complete your SLE ${formatMajorAmount(amountMinor)} contribution.`;
+  const providerName = SUPPORTED_PROVIDERS[provider] || "Mobile Money";
+  return `Dial ${ussdCode} from your ${providerName} line to complete your SLE ${formatMajorAmount(amountMinor)} contribution.`;
 }
 
 export default async function handler(request) {
@@ -47,6 +47,7 @@ export default async function handler(request) {
   try {
     const db = sql();
 
+    // Idempotency check for existing client request
     if (clientRequestId) {
       const existing = await db`
         SELECT reference, idempotency_key, contribution_type, customer_name,
@@ -56,7 +57,7 @@ export default async function handler(request) {
         WHERE client_request_id = ${clientRequestId}
         LIMIT 1;
       `;
-      if (existing.length) {
+      if (existing.length > 0) {
         const item = existing[0];
         return json({
           success: true,
@@ -89,6 +90,7 @@ export default async function handler(request) {
     const reference = `MTB-${randomUUID()}`;
     const idempotencyKey = randomUUID();
 
+    // 1. Insert initial PENDING contribution record
     await db`
       INSERT INTO contributions (
         id, contribution_type, customer_name, amount_minor, currency,
@@ -100,6 +102,7 @@ export default async function handler(request) {
       );
     `;
 
+    // 2. Build Monime API Payload
     const payload = {
       name: input.name,
       mode: "one_time",
@@ -121,6 +124,7 @@ export default async function handler(request) {
       },
     };
 
+    // 3. Call Monime Create Payment Code API
     const response = await fetch(MONIME_URL, {
       method: "POST",
       headers: {
@@ -150,6 +154,8 @@ export default async function handler(request) {
     }
 
     const result = data.result;
+
+    // 4. Update contribution with Monime details
     await db`
       UPDATE contributions
       SET
