@@ -2,7 +2,6 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { sql } from "../_lib/db.js";
 import { json, methodNotAllowed, logError } from "../_lib/http.js";
 
-// Valid payment success events across USSD Payment Codes and Hosted Checkout
 const SUCCESS_EVENT_TYPES = new Set([
   "payment_code.processed",
   "payment_code.completed",
@@ -77,7 +76,6 @@ export default async function handler(request) {
 
   const reference = findNestedValue(event, ["reference"]);
   const paymentCodeId = findNestedValue(event, ["paymentCodeId", "payment_code_id", "id"]);
-  const paymentId = findNestedValue(event, ["paymentId", "payment_id"]);
   const eventId = stableEventId(rawBody, getString(event, ["id", "eventId", "event_id"]));
 
   if (!reference && !paymentCodeId) {
@@ -87,6 +85,7 @@ export default async function handler(request) {
   try {
     const db = sql();
 
+    // Idempotency: Ignore duplicate webhook events
     const inserted = await db`
       INSERT INTO webhook_events (event_id, event_type, payload)
       VALUES (${eventId}, ${eventType}, ${rawBody}::jsonb)
@@ -98,6 +97,7 @@ export default async function handler(request) {
       return json({ received: true, duplicate: true }, 200);
     }
 
+    // Atomically transition contribution to PAID
     const updated = reference
       ? await db`
           UPDATE contributions
@@ -123,12 +123,6 @@ export default async function handler(request) {
         `;
 
     if (updated.length === 0) {
-      console.warn("Payment completed webhook did not match a pending contribution", {
-        reference,
-        paymentCodeId,
-        paymentId,
-        eventId,
-      });
       return json({ received: true, matched: false }, 200);
     }
 
