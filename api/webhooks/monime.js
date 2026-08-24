@@ -2,6 +2,13 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { sql } from "../_lib/db.js";
 import { json, methodNotAllowed, logError } from "../_lib/http.js";
 
+// Valid payment success events across USSD Payment Codes and Hosted Checkout
+const SUCCESS_EVENT_TYPES = new Set([
+  "payment_code.processed",
+  "payment_code.completed",
+  "checkout_session.completed",
+]);
+
 function stableEventId(rawBody, headerEventId) {
   if (headerEventId) return String(headerEventId);
   return `sha256:${createHash("sha256").update(rawBody).digest("hex")}`;
@@ -52,10 +59,6 @@ export default async function handler(request) {
   const rawBody = await request.text();
   const suppliedSecret = request.headers.get("x-maseray-webhook-secret");
 
-  // Monime supports custom outbound headers on webhooks. This header is an
-  // additional shared-secret gate. The Monime-Signature header is also sent
-  // by Monime; its exact signing construction should be implemented only
-  // from Monime's current signature-verification guide, not guessed here.
   if (!suppliedSecret || !constantTimeStringEqual(suppliedSecret, secret)) {
     return json({ error: "Unauthorized webhook." }, 401);
   }
@@ -68,12 +71,12 @@ export default async function handler(request) {
   }
 
   const eventType = getString(event, ["type", "event", "eventType", "name"]);
-  if (eventType !== "checkout_session.completed") {
-    return json({ received: true, ignored: true }, 200);
+  if (!eventType || !SUCCESS_EVENT_TYPES.has(eventType)) {
+    return json({ received: true, ignored: true, eventType }, 200);
   }
 
   const reference = findNestedValue(event, ["reference"]);
-  const paymentCodeId = findNestedValue(event, ["paymentCodeId", "payment_code_id"]);
+  const paymentCodeId = findNestedValue(event, ["paymentCodeId", "payment_code_id", "id"]);
   const paymentId = findNestedValue(event, ["paymentId", "payment_id"]);
   const eventId = stableEventId(rawBody, getString(event, ["id", "eventId", "event_id"]));
 
