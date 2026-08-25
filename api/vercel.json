@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/payment-codes.js": {
+      "runtime": "nodejs18.x"
+    }
+  }
+}
