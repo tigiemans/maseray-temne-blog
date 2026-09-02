@@ -2,71 +2,123 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { sql } from "../_lib/db.js";
 import { json, methodNotAllowed, logError } from "../_lib/http.js";
 
-const SUCCESS_EVENT_TYPES = new Set([
-  "payment.completed",
-  "payment_code.completed",
-  "payment_code.processed",
-  "checkout_session.completed",
-]);
-
+const MONIME_BASE = "https://api.monime.io/v1";
+const VERSION = process.env.MONIME_VERSION || "caph.2025-08-23";
 const MAX_BODY_BYTES = 1024 * 1024;
 
-function stableEventId(rawBody, headerEventId) {
-  if (headerEventId) return String(headerEventId);
-  return "sha256:" + createHash("sha256").update(rawBody).digest("hex");
-}
-
-function getString(obj, keys) {
-  if (!obj || typeof obj !== "object") return null;
-  for (const key of keys) {
-    const value = obj[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return null;
-}
-
-function findNestedValue(value, keys, depth = 0) {
-  if (depth > 8 || value == null) return null;
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findNestedValue(item, keys, depth + 1);
-      if (found != null) return found;
-    }
-    return null;
-  }
-  if (typeof value !== "object") return null;
-  const direct = getString(value, keys);
-  if (direct) return direct;
-  for (const child of Object.values(value)) {
-    const found = findNestedValue(child, keys, depth + 1);
-    if (found != null) return found;
-  }
-  return null;
-}
-
-function secretMatches(supplied, expected) {
-  if (!supplied) return false;
-  const left = Buffer.from(String(supplied).trim());
-  const right = Buffer.from(String(expected).trim());
+function safeEqual(a, b) {
+  if (!a || !b) return false;
+  const left = Buffer.from(String(a).trim());
+  const right = Buffer.from(String(b).trim());
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function authenticate(request, secret) {
+function authenticate(request) {
+  const expected = process.env.MONIME_WEBHOOK_TOKEN || process.env.MONIME_WEBHOOK_SECRET;
+  if (!expected || expected.length < 32) return false;
+
   const candidates = [
+    request.headers.get("x-maseray-webhook-token"),
     request.headers.get("x-maseray-webhook-secret"),
     request.headers.get("x-webhook-secret"),
     request.headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
   ];
-  return candidates.some((value) => secretMatches(value, secret));
+
+  return candidates.some((value) => safeEqual(value, expected));
+}
+
+function eventId(payload, rawBody) {
+  return typeof payload?.event?.id === "string" && payload.event.id.trim()
+    ? payload.event.id.trim()
+    : "sha256:" + createHash("sha256").update(rawBody, "utf8").digest("hex");
+}
+
+function eventName(payload) {
+  return typeof payload?.event?.name === "string" ? payload.event.name : null;
+}
+
+function objectId(payload) {
+  return typeof payload?.object?.id === "string" ? payload.object.id : null;
+}
+
+function objectType(payload) {
+  return typeof payload?.object?.type === "string" ? payload.object.type : null;
+}
+
+function numberValue(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function monimeGet(path) {
+  const token = process.env.MONIME_ACCESS_TOKEN;
+  const spaceId = process.env.MONIME_SPACE_ID;
+  if (!token || !spaceId) throw new Error("Monime API configuration is missing.");
+
+  const response = await fetch(MONIME_BASE + path, {
+    headers: {
+      Authorization: "Bearer " + token,
+      "Monime-Space-Id": spaceId,
+      "Monime-Version": VERSION,
+    },
+    cache: "no-store",
+  });
+
+  const data = await response.json().catch(() => null);
+  return { response, data };
+}
+
+async function verifyPaymentCode(contribution, payload) {
+  const id = objectId(payload);
+  if (!id || objectType(payload) !== "payment_code") return false;
+  if (payload?.data?.id && payload.data.id !== id) return false;
+
+  const remote = await monimeGet("/payment-codes/" + encodeURIComponent(id));
+  if (!remote.response.ok || !remote.data?.success || !remote.data?.result) return false;
+
+  const result = remote.data.result;
+  if (String(result.status || "").toLowerCase() !== "completed") return false;
+  if (result.progress?.isCompleted !== true) return false;
+
+  const amount = numberValue(result.amount?.value);
+  const currency = String(result.amount?.currency || "").toUpperCase();
+  if (amount === null || amount !== Number(contribution.amount_minor)) return false;
+  if (currency !== "SLE") return false;
+
+  const reference = typeof result.reference === "string" ? result.reference : null;
+  if (reference && reference !== contribution.reference) return false;
+
+  return true;
+}
+
+async function verifyCheckoutSession(contribution, payload) {
+  const id = objectId(payload);
+  if (!id || objectType(payload) !== "checkout_session") return false;
+
+  const remote = await monimeGet("/checkout-sessions/" + encodeURIComponent(id));
+  if (!remote.response.ok || !remote.data?.success || !remote.data?.result) return false;
+
+  const result = remote.data.result;
+  if (String(result.status || "").toLowerCase() !== "completed") return false;
+
+  const amount = numberValue(
+    result.amount?.value ?? result.lineItems?.data?.[0]?.price?.value
+  );
+  const currency = String(
+    result.amount?.currency ?? result.lineItems?.data?.[0]?.price?.currency ?? ""
+  ).toUpperCase();
+
+  if (amount === null || amount !== Number(contribution.amount_minor)) return false;
+  if (currency !== "SLE") return false;
+
+  const reference = typeof result.reference === "string" ? result.reference : null;
+  if (reference && reference !== contribution.reference) return false;
+
+  return true;
 }
 
 export default async function handler(request) {
   if (request.method !== "POST") return methodNotAllowed();
-
-  const secret = process.env.MONIME_WEBHOOK_SECRET;
-  if (!secret || secret.length < 32) {
-    return json({ error: "Webhook is not configured correctly." }, 503);
-  }
 
   const contentLength = request.headers.get("content-length");
   if (contentLength && Number(contentLength) > MAX_BODY_BYTES) {
@@ -78,78 +130,118 @@ export default async function handler(request) {
     return json({ error: "Webhook payload is too large." }, 413);
   }
 
-  if (!authenticate(request, secret)) {
-    console.error("Monime webhook authentication failed", {
-      hasCustomHeader: Boolean(request.headers.get("x-maseray-webhook-secret")),
-      hasWebhookHeader: Boolean(request.headers.get("x-webhook-secret")),
-      hasAuthorization: Boolean(request.headers.get("authorization")),
-    });
+  if (!authenticate(request)) {
     return json({ error: "Unauthorized webhook." }, 401);
   }
 
-  let event;
+  let payload;
   try {
-    event = JSON.parse(rawBody);
+    payload = JSON.parse(rawBody);
   } catch {
     return json({ error: "Invalid JSON body." }, 400);
   }
 
-  const eventType = findNestedValue(event, ["type", "event", "eventType", "name"]);
-  if (!eventType || !SUCCESS_EVENT_TYPES.has(eventType)) {
-    return json({ received: true, ignored: true, eventType }, 200);
+  const name = eventName(payload);
+  const supported = new Set([
+    "payment_code.created",
+    "payment_code.processed",
+    "payment_code.completed",
+    "payment_code.expired",
+    "checkout_session.completed",
+  ]);
+
+  if (!name || !supported.has(name)) {
+    return json({ received: true, ignored: true, event: name }, 200);
   }
 
-  const reference = findNestedValue(event, [
-    "reference",
-    "contributionReference",
-    "orderReference",
-  ]);
-  const paymentCodeId = findNestedValue(event, [
-    "paymentCodeId",
-    "payment_code_id",
-    "checkoutSessionId",
-    "checkout_session_id",
-    "paymentId",
-    "payment_id",
-  ]);
-  const eventId = stableEventId(
-    rawBody,
-    getString(event, ["id", "eventId", "event_id"])
-  );
-
-  if (!reference && !paymentCodeId) {
-    return json({ error: "Missing payment reference/payment identifier." }, 400);
-  }
+  const id = eventId(payload, rawBody);
 
   try {
     const db = sql();
 
     const inserted = await db.query(
-      "INSERT INTO webhook_events (event_id, event_type, payload) VALUES ($1, $2, $3::jsonb) ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
-      [eventId, eventType, rawBody]
+      "INSERT INTO webhook_events (event_id, event_type, payload) VALUES ($1,$2,$3::jsonb) ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
+      [id, name, rawBody]
     );
 
     if (inserted.length === 0) {
       return json({ received: true, duplicate: true }, 200);
     }
 
-    const updated = reference
-      ? await db.query(
-          "UPDATE contributions SET status = 'PAID', paid_at = COALESCE(paid_at, NOW()), monime_status = 'completed', webhook_event_id = $1, webhook_payload = $2::jsonb WHERE reference = $3 AND status <> 'PAID' RETURNING id, reference, status",
-          [eventId, rawBody, reference]
-        )
-      : await db.query(
-          "UPDATE contributions SET status = 'PAID', paid_at = COALESCE(paid_at, NOW()), monime_status = 'completed', webhook_event_id = $1, webhook_payload = $2::jsonb WHERE monime_payment_code_id = $3 AND status <> 'PAID' RETURNING id, reference, status",
-          [eventId, rawBody, paymentCodeId]
-        );
+    const resourceId = objectId(payload);
 
-    if (updated.length === 0) {
+    const rows = resourceId
+      ? await db.query(
+          "SELECT id, reference, amount_minor, status, monime_payment_code_id, client_request_id FROM contributions WHERE monime_payment_code_id = $1 OR client_request_id = $1 LIMIT 1",
+          [resourceId]
+        )
+      : [];
+
+    const contribution = rows[0];
+
+    if (!contribution) {
+      console.warn("Monime webhook has no matching local contribution", {
+        eventId: id,
+        event: name,
+        resourceId,
+      });
       return json({ received: true, matched: false }, 200);
     }
 
-    return json({ received: true, matched: true, status: "PAID" }, 200);
+    if (contribution.status === "PAID") {
+      return json({ received: true, alreadyPaid: true }, 200);
+    }
+
+    if (name === "payment_code.created") {
+      return json({ received: true, matched: true, status: contribution.status }, 200);
+    }
+
+    if (name === "payment_code.processed") {
+      await db.query(
+        "UPDATE contributions SET monime_status = 'processed', webhook_event_id = $1, webhook_payload = $2::jsonb WHERE id = $3 AND status <> 'PAID'",
+        [id, rawBody, contribution.id]
+      );
+      return json({ received: true, matched: true, status: "PENDING" }, 200);
+    }
+
+    if (name === "payment_code.expired") {
+      await db.query(
+        "UPDATE contributions SET status = 'EXPIRED', monime_status = 'expired', webhook_event_id = $1, webhook_payload = $2::jsonb WHERE id = $3 AND status = 'PENDING'",
+        [id, rawBody, contribution.id]
+      );
+      return json({ received: true, matched: true, status: "EXPIRED" }, 200);
+    }
+
+    const verified = name === "payment_code.completed"
+      ? await verifyPaymentCode(contribution, payload)
+      : await verifyCheckoutSession(contribution, payload);
+
+    if (!verified) {
+      console.error("Monime webhook payment verification failed", {
+        eventId: id,
+        event: name,
+        contributionId: contribution.id,
+      });
+      return json({ received: true, matched: true, verified: false }, 200);
+    }
+
+    const updated = await db.query(
+      "UPDATE contributions SET status = 'PAID', paid_at = COALESCE(paid_at, NOW()), monime_status = 'completed', webhook_event_id = $1, webhook_payload = $2::jsonb WHERE id = $3 AND status <> 'PAID' RETURNING id, reference, status",
+      [id, rawBody, contribution.id]
+    );
+
+    return json({
+      received: true,
+      matched: updated.length > 0,
+      status: updated[0]?.status || "PAID",
+      verified: true,
+    }, 200);
   } catch (error) {
-    logError("Monime webhook processing failed", error, { eventId });
+    logError("Monime webhook processing failed", error, { eventId: id, event: name });
     return json({ error: "Webhook processing failed." }, 500);
   }
+}
+
+export async function GET() {
+  return json({ ok: true, endpoint: "monime-webhook" }, 200);
 }
