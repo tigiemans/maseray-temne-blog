@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { sql } from "../_lib/db.js";
 import { json, methodNotAllowed, logError } from "../_lib/http.js";
 
@@ -10,8 +10,6 @@ const SUCCESS_EVENT_TYPES = new Set([
 ]);
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const MAX_SIGNATURE_AGE_SECONDS = 300;
-const MAX_FUTURE_SKEW_SECONDS = 30;
 
 function stableEventId(rawBody, headerEventId) {
   if (headerEventId) return String(headerEventId);
@@ -46,56 +44,20 @@ function findNestedValue(value, keys, depth = 0) {
   return null;
 }
 
-function constantTimeStringEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
+function secretMatches(supplied, expected) {
+  if (!supplied) return false;
+  const left = Buffer.from(String(supplied).trim());
+  const right = Buffer.from(String(expected).trim());
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function digestEqual(expectedHex, supplied) {
-  const value = String(supplied).trim().toLowerCase();
-  const expected = Buffer.from(expectedHex, "hex");
-  let actual;
-  if (/^[0-9a-f]{64}$/.test(value)) actual = Buffer.from(value, "hex");
-  else {
-    try { actual = Buffer.from(value, "base64"); } catch { return false; }
-  }
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
-function verifyMonimeSignature(request, rawBody, secret) {
-  const header = request.headers.get("monime-signature");
-  if (!header) return false;
-
-  const parts = new Map();
-  for (const part of header.split(",")) {
-    const i = part.indexOf("=");
-    if (i > 0) parts.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
-  }
-
-  const timestamp = parts.get("t");
-  const headerNames = parts.get("h");
-  const supplied = parts.get("v1");
-  const timestampSeconds = Number(timestamp);
-  if (!timestamp || !headerNames || !supplied || !Number.isSafeInteger(timestampSeconds)) return false;
-
-  const now = Math.floor(Date.now() / 1000);
-  const age = now - timestampSeconds;
-  if (age > MAX_SIGNATURE_AGE_SECONDS || age < -MAX_FUTURE_SKEW_SECONDS) return false;
-
-  const names = headerNames.split(/\s+/).filter(Boolean);
-  const headerValues = names.map((name) => request.headers.get(name) ?? "").join(".");
-  const signedPayload = timestampSeconds + "." + headerNames + "." + headerValues + "." + rawBody;
-  const expected = createHmac("sha256", secret).update(signedPayload, "utf8").digest("hex");
-
-  return supplied.split(/\s+/).some((signature) => digestEqual(expected, signature));
-}
-
-function authenticate(request, rawBody, secret) {
-  const custom = request.headers.get("x-maseray-webhook-secret");
-  if (custom && constantTimeStringEqual(custom, secret)) return "custom-header";
-  if (verifyMonimeSignature(request, rawBody, secret)) return "monime-signature";
-  return null;
+function authenticate(request, secret) {
+  const candidates = [
+    request.headers.get("x-maseray-webhook-secret"),
+    request.headers.get("x-webhook-secret"),
+    request.headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
+  ];
+  return candidates.some((value) => secretMatches(value, secret));
 }
 
 export default async function handler(request) {
@@ -116,29 +78,44 @@ export default async function handler(request) {
     return json({ error: "Webhook payload is too large." }, 413);
   }
 
-  const authMethod = authenticate(request, rawBody, secret);
-  if (!authMethod) {
+  if (!authenticate(request, secret)) {
     console.error("Monime webhook authentication failed", {
-      hasSignature: Boolean(request.headers.get("monime-signature")),
       hasCustomHeader: Boolean(request.headers.get("x-maseray-webhook-secret")),
+      hasWebhookHeader: Boolean(request.headers.get("x-webhook-secret")),
+      hasAuthorization: Boolean(request.headers.get("authorization")),
     });
     return json({ error: "Unauthorized webhook." }, 401);
   }
 
   let event;
-  try { event = JSON.parse(rawBody); }
-  catch { return json({ error: "Invalid JSON body." }, 400); }
+  try {
+    event = JSON.parse(rawBody);
+  } catch {
+    return json({ error: "Invalid JSON body." }, 400);
+  }
 
   const eventType = findNestedValue(event, ["type", "event", "eventType", "name"]);
   if (!eventType || !SUCCESS_EVENT_TYPES.has(eventType)) {
     return json({ received: true, ignored: true, eventType }, 200);
   }
 
-  const reference = findNestedValue(event, ["reference", "contributionReference", "orderReference"]);
-  const paymentCodeId = findNestedValue(event, [
-    "paymentCodeId", "payment_code_id", "checkoutSessionId", "checkout_session_id", "paymentId", "payment_id"
+  const reference = findNestedValue(event, [
+    "reference",
+    "contributionReference",
+    "orderReference",
   ]);
-  const eventId = stableEventId(rawBody, getString(event, ["id", "eventId", "event_id"]));
+  const paymentCodeId = findNestedValue(event, [
+    "paymentCodeId",
+    "payment_code_id",
+    "checkoutSessionId",
+    "checkout_session_id",
+    "paymentId",
+    "payment_id",
+  ]);
+  const eventId = stableEventId(
+    rawBody,
+    getString(event, ["id", "eventId", "event_id"])
+  );
 
   if (!reference && !paymentCodeId) {
     return json({ error: "Missing payment reference/payment identifier." }, 400);
@@ -147,12 +124,12 @@ export default async function handler(request) {
   try {
     const db = sql();
 
-    const insertResult = await db.query(
+    const inserted = await db.query(
       "INSERT INTO webhook_events (event_id, event_type, payload) VALUES ($1, $2, $3::jsonb) ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
       [eventId, eventType, rawBody]
     );
 
-    if (insertResult.length === 0) {
+    if (inserted.length === 0) {
       return json({ received: true, duplicate: true }, 200);
     }
 
